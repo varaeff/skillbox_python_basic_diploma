@@ -1,224 +1,29 @@
 import telebot
-from botrequests import bestdeal, highprice, history
 from decouple import config
-import parsing
+from modules.api_work import hotels_list, city_destination_id
+from modules.db_work import BDqueries
+from modules.history import set_log, get_history
+from modules.service_funcs import check_num, Dicts
 from telegram_bot_calendar import DetailedTelegramCalendar, LSTEP
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+from loguru import logger
+from typing import List
+
+logger.add("debuglog.log", format="{time:YYYY-MM-DD at HH:mm:ss} | {level} | {name} : {function} : {line} | "
+                                  "{message}", level="WARNING")
+logger.add("catch_log.log", filter=lambda record: "special" in record["extra"],
+           format="{time:YYYY-MM-DD at HH:mm:ss} | {level} | {name} : {function} : {line} | {message}")
 
 token = config('BOT_TOKEN')
 bot = telebot.TeleBot(token)
 
 
-def init_database() -> None:
-    """Функция проверяет в БД наличие таблиц и создает их в случае отсутствия"""
-    # история диалогов с пользователями
-    parsing.bd_update('''CREATE TABLE IF NOT EXISTS main_log
-                        (message_id INTEGER PRIMARY KEY, 
-                         chat_id INTEGER, 
-                         user_id INTEGER, 
-                         username TEXT, 
-                         date INTEGER, 
-                         text TEXT,
-                         photos TEXT)''')
-    # открытые на данный момент диалоги
-    parsing.bd_update('''CREATE TABLE IF NOT EXISTS current_dialogs
-                         (chat_id INTEGER, 
-                          query_type TEXT,
-                          stage INTEGER, 
-                          city_id INTEGER, 
-                          check_in TEXT, 
-                          check_out TEXT, 
-                          guests_num INTEGER, 
-                          hotels_num INTEGER, 
-                          photos_num INTEGER)''')
-    # города, по которым уже производился поиск
-    parsing.bd_update('''CREATE TABLE IF NOT EXISTS cities_code
-                        (city_id INTEGER, 
-                         city_name TEXT)''')
-    # фотографии отелей, по которым была выдача
-    parsing.bd_update('''CREATE TABLE IF NOT EXISTS photos_url
-                        (hotel_id INTEGER, 
-                         photo_id INTEGER,
-                         photo_url TEXT)''')
-
-
-def check_num(check_data: str, min_num: int, max_num: int, chat_id: int) -> bool:
-    """Функция проверяет, что в диалоге было введено число в указанном диапазоне"""
-    try:
-        num = int(check_data)
-    except ValueError as exc:
-        history.errors_log('func - check_num: ' + str(exc))
-        bot.send_message(chat_id, 'Введите число от {min} до {max}!'.format(min=str(min_num), max=str(max_num)))
-        return False
-    if not min_num <= num <= max_num:
-        bot.send_message(chat_id, 'Введите число от {min} до {max}!'.format(min=str(min_num), max=str(max_num)))
-        return False
-    return True
-
-
-def dispetcher(message: telebot.types.Message, stage: int) -> None:
-    """Функция узнает у пользователя параметры запроса, сохраняет их в БД и определяет дальнейшие действия"""
-
-    # сообщения для отправки пользлвателю в зависимости от этапа диалога
-    messages = {0: 'Введите город для поиска отелей (латиницей на английском)',
-                1: 'Выберите дату заезда из календаря.',
-                4: 'Сколько отелей вы хотите посмотреть (от 1 до 10)?',
-                5: 'Сколько фотографий каждого отеля вы хотите посмотреть (от 0 до 5)?',
-                'city': 'Такой город не найден. Возможно, ошибка в написании. Пожалуйста, повторите ввод.'}
-
-    # запросы к БД в зависимости от этапа диалога
-    queries = {1: "UPDATE current_dialogs SET stage = 1, city_id = {cc} WHERE chat_id = {id}",
-               4: "UPDATE current_dialogs SET stage = 4, guests_num = {mt} WHERE chat_id = {id}",
-               5: "UPDATE current_dialogs SET stage = 5, hotels_num = {mt} WHERE chat_id = {id}",
-               6: "UPDATE current_dialogs SET stage = 6, photos_num = {mt} WHERE chat_id = {id}",
-               'city': "SELECT * FROM cities_code WHERE city_name = '{mt}'",
-               'add_city': "INSERT INTO cities_code VALUES ({cc}, '{mt}')"}
-
-    # начало диалога, узнаем город для запроса
-    if stage == 0:
-        bot.send_message(message.chat.id, messages[stage])
-
-    # узнаем дату заезда
-    elif stage == 1:
-        # пытаемся найти город среди тех, по которым уже был запрос
-        query = queries['city'].format(mt=message.text.capitalize())
-        rows = parsing.bd_select(query)
-
-        # если нашли, используем id из БД
-        if len(rows) != 0:
-            city_code = rows[0][0]
-        else:
-            # если в БД город не найден, делаем запрос к API
-            city_code = parsing.city_destination_id(message.text.capitalize())
-            if city_code is None:
-                # если API ничего не вернул, просим повторить ввод
-                bot.send_message(message.chat.id, messages['city'])
-                return None
-            else:
-                # сохраняем город в БД
-                query = queries['add_city'].format(cc=city_code, mt=message.text.capitalize())
-                parsing.bd_update(query)
-        # добавляем город в текущий диалог
-        query = queries[stage].format(cc=str(city_code), id=str(message.chat.id))
-        parsing.bd_update(query)
-        bot.send_message(message.chat.id, messages[stage])
-
-        # отсылаем в диалог календарь для выбора даты заезда
-        calendar, step = DetailedTelegramCalendar().build()
-        bot.send_message(message.chat.id, f"Select {LSTEP[step]}", reply_markup=calendar)
-
-    # этапы выбора дат. Не реагируем на текстовые сообщения, ждем ответ от календаря
-    elif stage == 2 or stage == 3:
-        bot.delete_message(message.chat.id, message.message_id)
-
-    # узнаем количество гостей для выборки
-    elif stage == 4:
-        if not check_num(message.text, 1, 10, message.chat.id):
-            return None
-        query = queries[stage].format(mt=message.text, id=str(message.chat.id))
-        parsing.bd_update(query)
-        bot.send_message(message.chat.id, messages[stage])
-
-    # узнаем количество отелей для выборки
-    elif stage == 5:
-        if not check_num(message.text, 1, 10, message.chat.id):
-            return None
-        query = queries[stage].format(mt=message.text, id=str(message.chat.id))
-        parsing.bd_update(query)
-        bot.send_message(message.chat.id, messages[stage])
-
-    # финальный этап. Узнаем количество фотографий для запроса, формируем и отсылаем запрос к API,
-    # сохраняем историю, закрываем текущий диалог
-    else:
-        if not check_num(message.text, 0, 5, message.chat.id):
-            return None
-
-        bot.send_message(message.chat.id, 'Подбираем для вас варианты...')
-
-        query = queries[stage].format(mt=message.text, id=str(message.chat.id))
-        parsing.bd_update(query)
-
-        # инициализируем параметры запроса в API
-        query = 'SELECT * FROM current_dialogs WHERE chat_id = ' + str(message.chat.id)
-        rows = parsing.bd_select(query)
-        q_type, city_id, check_in, check_out, guest_num, num_hotels, num_photos = \
-            rows[0][1], rows[0][3], rows[0][4], rows[0][5], rows[0][6], rows[0][7], rows[0][8]
-
-        # записываем запрос в историю
-        query = "SELECT * FROM cities_code WHERE city_id = {id}".format(id=str(city_id))
-        rows = parsing.bd_select(query)
-        city_name = rows[0][1]
-        user_message = "Найди {nh} самых дешёвых отелей для {gn} гостей в городе {cn}.\n" \
-                       "Дата заезда: {ci}, дата отъезда: {co}.\n" \
-                       "Покажи {pn} фотографий каждого отеля".format(nh=num_hotels,
-                                                                     gn=guest_num,
-                                                                     cn=city_name,
-                                                                     ci=check_in,
-                                                                     co=check_out,
-                                                                     pn=num_photos)
-        history.set_log(message.message_id, message.chat.id, message.from_user.id, message.from_user.username,
-                        message.date, user_message, '')
-
-        # запрашиваем данные
-        output = parsing.hotels_list(str(city_id), str(check_in), str(check_out), str(guest_num), str(num_hotels),
-                                     num_photos)
-        # выдаем ответ пользователю
-        if num_photos == 0:
-            output_txt = ''
-            for i_elem in output:
-                output_txt += i_elem[0]
-
-            answer = bot.send_message(message.chat.id, output_txt, parse_mode="HTML", disable_web_page_preview=True)
-            # сохраняем историю
-            history.set_log(answer.message_id, answer.chat.id, answer.from_user.id, answer.from_user.username,
-                            answer.date, output_txt, '')
-        else:
-            add_id = 1
-            for i_elem in output:
-                query = 'SELECT photo_url FROM photos_url WHERE hotel_id = {id} LIMIT {n}'.format(n=str(num_photos),
-                                                                                                  id=str(i_elem[1]))
-                links = parsing.bd_select(query)
-                # проверяем, нашлись ли в базе фотки
-                if len(links) > 0:
-                    medias = []
-                    links_to_log = links[0][0]
-                    media = telebot.types.InputMediaPhoto(links[0][0], caption=i_elem[0], parse_mode="HTML")
-                    medias.append(media)
-                    for i_link in range(1, len(links)):
-                        media = telebot.types.InputMediaPhoto(links[i_link][0])
-                        medias.append(media)
-                        links_to_log += ',' + links[i_link][0]
-                    bot.send_media_group(message.chat.id, medias)
-                    # сохраняем историю
-                    history.set_log(message.message_id + add_id, message.chat.id, 5161451101, 'HotelsVrvBot',
-                                    message.date, i_elem[0], links_to_log)
-                    add_id += 1
-                # если был сбой и в базе пусто, выдаем ответ без них
-                else:
-                    answer = bot.send_message(message.chat.id, i_elem[0], parse_mode="HTML",
-                                              disable_web_page_preview=True)
-                    # сохраняем историю
-                    history.set_log(answer.message_id, answer.chat.id, answer.from_user.id, answer.from_user.username,
-                                    answer.date, i_elem[0], '')
-
-        # очищаем текущий диалог
-        query = 'DELETE FROM current_dialogs WHERE chat_id = {id}'.format(id=str(message.chat.id))
-        parsing.bd_update(query)
-
-
-def new_session(message: telebot.types.Message, command: str) -> None:
-    """Функция создает в БД строку нового открытого диалога"""
-    query = "INSERT INTO current_dialogs VALUES ({id}, '{cmd}', 0, NULL, NULL, NULL, NULL, NULL, " \
-            "NULL)".format(id=str(message.chat.id), cmd=command)
-    parsing.bd_update(query)
-    dispetcher(message, 0)
-
-
+@logger.catch
 def get_text_messages(message: telebot.types.Message) -> None:
     """Функция запускает ветку нового диалога с пользователем в зависимости от полученного сообщения"""
     if not message.text.startswith('/'):
-        history.set_log(message.message_id, message.chat.id, message.from_user.id, message.from_user.username,
-                        message.date, message.text, '')
+        set_log(message.message_id, message.chat.id, message.from_user.id, message.from_user.username, message.date,
+                message.text, '')
 
     if message.text.lower() == "привет":
         answer_text = 'Привет, <b>' + message.from_user.username + \
@@ -228,11 +33,15 @@ def get_text_messages(message: telebot.types.Message) -> None:
         return None
 
     elif message.text == "/highprice":
-        answer_text = highprice.get_hidhprice()
+        new_session(message, 'highprice')
+        return None
+
     elif message.text == "/bestdeal":
-        answer_text = bestdeal.get_bestdeal()
+        new_session(message, 'bestdeal')
+        return None
+
     elif message.text == "/history":
-        parts = history.get_history(message.chat.id)
+        parts = get_history(message.chat.id)
         for row in parts:
             if row[1] == '':
                 bot.send_message(message.chat.id, row[0], parse_mode="HTML", disable_web_page_preview=True)
@@ -254,20 +63,335 @@ def get_text_messages(message: telebot.types.Message) -> None:
                       '/bestdeal - узнать список самых дешёвых отелей в городе, находящихся ближе всего к центру\n' \
                       '/history - узнать историю поиска отелей\n' \
                       '/help - помощь по командам бота'
+
     else:
         answer_text = "Команда не распознана! Повторите ввод."
 
     if len(answer_text) > 0:
         answer = bot.send_message(message.chat.id, answer_text, parse_mode="HTML")
         if not message.text.startswith('/'):
-            history.set_log(answer.message_id, answer.chat.id, answer.from_user.id, answer.from_user.username,
-                            answer.date, answer_text, '')
+            set_log(answer.message_id, answer.chat.id, answer.from_user.id, answer.from_user.username, answer.date,
+                    answer_text, '')
 
 
-@bot.callback_query_handler(func=DetailedTelegramCalendar.func())
-def cal(c: telebot.types.CallbackQuery) -> None:
-    """Функция ловит ответ календаря"""
-    result, key, step = DetailedTelegramCalendar().process(c.data)
+@logger.catch
+def new_session(message: telebot.types.Message, command: str) -> None:
+    """Функция создает в БД строку нового открытого диалога"""
+    values = {'id': str(message.chat.id), 'cmd': command}
+    BDqueries.insert_row('current_dialogs', ':id, :cmd, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL', values)
+    dispetcher(message, 0)
+
+
+@logger.catch
+def dispetcher(message: telebot.types.Message, stage: int) -> None:
+    """Функция узнает у пользователя параметры запроса, сохраняет их в БД и определяет дальнейшие действия"""
+    # начало диалога, узнаем город для запроса
+    if stage == 0:
+        bot.send_message(message.chat.id, 'Введите город для поиска отелей (латиницей на английском)')
+
+    # узнаем дату заезда
+    elif stage == 1:
+        # пытаемся найти город среди тех, по которым уже был запрос
+        rows = BDqueries.select_rows('cities_code', 'city_name', message.text.capitalize())
+
+        # если нашли хоть один, формируем словарь для дальнейшей обработки
+        if len(rows) > 0:
+            cities = []
+            city = {}
+            for i_row in rows:
+                city["destinationId"] = i_row[0]
+                city["latitude"] = i_row[2]
+                city["longitude"] = i_row[3]
+                city["caption"] = i_row[4]
+                cities.append(city)
+                city = {}
+        else:
+            # если в БД город не найден, делаем запрос к API
+            cities = city_destination_id(message.text.capitalize())
+
+            if cities is None or len(cities) == 0:
+                # если API ничего не вернул, просим повторить ввод
+                bot.send_message(message.chat.id, 'Такой город не найден. Возможно, ошибка в написании. '
+                                                  'Пожалуйста, повторите ввод.')
+                return None
+            else:
+                # сохраняем найденные города в БД
+                for i_city in cities:
+                    values = {'id': i_city["destinationId"],
+                              'mt': message.text.capitalize(),
+                              'lt': float(i_city["latitude"]),
+                              'lg': float(i_city["longitude"]),
+                              'cpt': i_city["caption"]}
+                    BDqueries.insert_row('cities_code', ':id, :mt, :lt, :lg, :cpt', values)
+
+        # проверяем, сколько городов нашли
+        if len(cities) > 1:
+            # меняем стадию диалога для колбэка
+            BDqueries.set_field_param('stage', '7', message.chat.id)
+            # отсылаем пользователю список найденных городов в кнопках для выбора нужного
+            choose_city(message.chat.id, cities)
+            return None
+        else:
+            # добавляем город в текущий диалог
+            BDqueries.set_field_param('stage', '1', message.chat.id)
+            BDqueries.set_field_param('city_id', str(cities[0]["destinationId"]), message.chat.id)
+
+            # если обрабатывается команда bestdeal, включаем сбор дополнительных данных
+            rows = BDqueries.select_rows('current_dialogs', 'chat_id', str(message.chat.id))
+            if rows[0][1] == 'bestdeal':
+                choose_price(message.chat.id)
+            else:
+                # переходим к выбору даты заезда
+                bot.send_message(message.chat.id, 'Выберите дату заезда из календаря.')
+                # отсылаем в диалог календарь для выбора даты заезда
+                calendar, step = DetailedTelegramCalendar(min_date=date.today() + timedelta(days=1)).build()
+                bot.send_message(message.chat.id, f"Select {LSTEP[step]}", reply_markup=calendar)
+
+    # этапы выбора дат. Не реагируем на текстовые сообщения, ждем ответ от календаря
+    # 8 - запрет реакции на сообщения при ожидании выбора города с клавиатуры
+    elif 1 < stage < 4 or stage > 7:
+        bot.delete_message(message.chat.id, message.message_id)
+
+    # узнаем количество гостей для выборки
+    elif stage == 4:
+        if not check_num(message.text, 1, 10):
+            bot.send_message(message.chat.id, 'Введите число от 1 до 10!')
+            return None
+        BDqueries.set_field_param('stage', '4', message.chat.id)
+        BDqueries.set_field_param('guests_num', message.text, message.chat.id)
+        bot.send_message(message.chat.id, 'Сколько отелей вы хотите посмотреть (от 1 до 10)?')
+
+    # узнаем количество отелей для выборки
+    elif stage == 5:
+        if not check_num(message.text, 1, 10):
+            bot.send_message(message.chat.id, 'Введите число от 1 до 10!')
+            return None
+        BDqueries.set_field_param('stage', '5', message.chat.id)
+        BDqueries.set_field_param('hotels_num', message.text, message.chat.id)
+        bot.send_message(message.chat.id, 'Сколько фотографий каждого отеля вы хотите посмотреть (от 0 до 5)?')
+
+    # финальный этап. Узнаем количество фотографий для запроса, формируем и отсылаем запрос к API,
+    # сохраняем историю, закрываем текущий диалог
+    else:
+        if not check_num(message.text, 0, 5):
+            bot.send_message(message.chat.id, 'Введите число от 0 до 5!')
+            return None
+
+        bot.send_message(message.chat.id, 'Подбираем для вас варианты...')
+
+        BDqueries.set_field_param('stage', '6', message.chat.id)
+        BDqueries.set_field_param('photos_num', message.text, message.chat.id)
+
+        # инициализируем параметры запроса в API
+        rows = BDqueries.select_rows('current_dialogs', 'chat_id', str(message.chat.id))
+        q_type, city_id, check_in, check_out, guest_num, num_hotels, num_photos = \
+            rows[0][1], rows[0][3], rows[0][4], rows[0][5], rows[0][6], rows[0][7], rows[0][8]
+
+        # записываем запрос в историю
+        city_name = BDqueries.get_city_name(city_id)
+        goal = {'lowprice': 'дешёвых', 'highprice': 'дорогих', 'bestdeal': 'дешёвых и близких к центру'}
+        user_message = "Найди {nh} самых {gl} отелей для {gn} гостей в городе {cn}.\n" \
+                       "Дата заезда: {ci}, дата отъезда: {co}.\n" \
+                       "Покажи {pn} фотографий каждого отеля".format(nh=num_hotels,
+                                                                     gl=goal[q_type],
+                                                                     gn=guest_num,
+                                                                     cn=city_name,
+                                                                     ci=check_in,
+                                                                     co=check_out,
+                                                                     pn=num_photos)
+        if q_type == 'bestdeal':
+            price_range, distance_range = str(rows[0][9]), str(rows[0][10])
+            add_msg = "\nВыведи отели в ценовом диапазоне {pr}, расположенные на расстоянии {dr} от " \
+                      "центра города".format(pr=Dicts.prices[price_range], dr=Dicts.distances[distance_range])
+            user_message += add_msg
+        else:
+            price_range, distance_range = '0', '0'
+
+        set_log(message.message_id, message.chat.id, message.from_user.id, message.from_user.username, message.date,
+                user_message, '')
+
+        # запрашиваем данные
+        output = hotels_list(str(city_id), q_type, check_in, check_out, str(guest_num), str(num_hotels), num_photos,
+                             price_range, distance_range, 1, 0, [])
+        # выдаем ответ пользователю
+        # - ответ без фотографий
+        if num_photos == 0:
+            output_txt = ''
+            for i_elem in output:
+                output_txt += i_elem[0]
+
+            answer = bot.send_message(message.chat.id, output_txt, parse_mode="HTML", disable_web_page_preview=True)
+            # сохраняем историю
+            set_log(answer.message_id, answer.chat.id, answer.from_user.id, answer.from_user.username, answer.date,
+                    output_txt, '')
+        # - ответ с фотографиями
+        else:
+            add_id = 1
+            for i_elem in output:
+                links = list()
+                rows = BDqueries.select_rows('photos_url', 'hotel_id', str(i_elem[1]))
+                for i_link in range(num_photos):
+                    try:
+                        links.append(rows[i_link][2])
+                    except Exception as exc:
+                        logger.bind(special=True).info('Ошибка при чтении фотографии из базы, error - {}'
+                                                       .format(exc.__str__()))
+                        continue
+                # пытаемся отправить сообщение с фотографиями
+                try:
+                    medias = []
+                    links_to_log = links[0]
+                    media = telebot.types.InputMediaPhoto(links[0], caption=i_elem[0], parse_mode="HTML")
+                    medias.append(media)
+                    for i_link in range(1, len(links)):
+                        media = telebot.types.InputMediaPhoto(links[i_link])
+                        medias.append(media)
+                        links_to_log += ',' + links[i_link]
+                    bot.send_media_group(message.chat.id, medias)
+                    # сохраняем историю
+                    set_log(message.message_id + add_id, message.chat.id, 5161451101, 'HotelsVrvBot', message.date,
+                            i_elem[0], links_to_log)
+                    add_id += 1
+                # если был сбой и в базе пусто или произошел сбой отправки, выдаем ответ без них
+                except Exception as exc:
+                    logger.bind(special=True).info('Ошибка при попытке отправки медиагруппы, error - {}'
+                                                   .format(exc.__str__()))
+                    answer = bot.send_message(message.chat.id, i_elem[0], parse_mode="HTML",
+                                              disable_web_page_preview=True)
+                    # сохраняем историю
+                    set_log(answer.message_id, answer.chat.id, answer.from_user.id, answer.from_user.username,
+                            answer.date, i_elem[0], '')
+
+        # очищаем текущий диалог
+        BDqueries.delete_row(message.chat.id)
+
+
+@logger.catch
+def choose_city(chat_id: int, cities: List[dict]) -> None:
+    """функция формирования и отправки клавиатуры с выбором городов из найденных по запросу"""
+    keyboard = telebot.types.InlineKeyboardMarkup()
+    for i_city in cities:
+        key = telebot.types.InlineKeyboardButton(text=i_city["caption"], callback_data=i_city["destinationId"])
+        keyboard.add(key)
+    bot.send_message(chat_id, 'По запросу найдено несколько городов. Выберите нужный:', reply_markup=keyboard)
+
+
+@logger.catch
+def choose_price(chat_id: int) -> None:
+    """функция формирования и отправки клавиатуры с выбором диапазона цен"""
+    # задаем стадию диалога
+    BDqueries.set_field_param('stage', '8', chat_id)
+
+    # формируем клавиатуру
+    keyboard = telebot.types.InlineKeyboardMarkup()
+    keys = Dicts.prices
+    for key, value in keys.items():
+        keyboard.add(telebot.types.InlineKeyboardButton(text=value, callback_data=key))
+
+    # отправляем в чат
+    bot.send_message(chat_id, 'Выберите подходящую цену за ночь:', reply_markup=keyboard)
+
+
+@logger.catch
+def choose_distance(chat_id: int) -> None:
+    """функция формирования и отправки клавиатуры с выбором диапазона цен"""
+    # задаем стадию диалога
+    BDqueries.set_field_param('stage', '9', chat_id)
+
+    # формируем клавиатуру
+    keyboard = telebot.types.InlineKeyboardMarkup()
+    keys = Dicts.distances
+    for key, value in keys.items():
+        keyboard.add(telebot.types.InlineKeyboardButton(text=value, callback_data=key))
+
+    bot.send_message(chat_id, 'Выберите предпочитаемое расстояние до центра города:', reply_markup=keyboard)
+
+
+@logger.catch
+@bot.message_handler(content_types=['text'])
+def listener(message: telebot.types.Message) -> None:
+    """Функция слушает сообщения из телеги"""
+    # Проверяем, существует ли активный диалог с данным пользователем
+    rows = BDqueries.select_rows('current_dialogs', 'chat_id', str(message.chat.id))
+
+    if len(rows) == 0:
+        # Если нет, запускаем стартовое распознавание запроса
+        get_text_messages(message)
+        # если пользователь ввел новую команду, сбрасываем текущий диалог, стартуем с нуля
+    elif message.text.startswith('/'):
+        BDqueries.delete_row(message.chat.id)
+        get_text_messages(message)
+    else:
+        # Если диалог найден, перебрасываем на продолжение
+        dispetcher(message, rows[0][2] + 1)
+
+
+@logger.catch
+@bot.callback_query_handler(func=lambda call: call.data.isdigit)
+def keyboard_select(c: telebot.types.CallbackQuery) -> None:
+    """функция ловит ответы клавиатуры и календаря"""
+    # узнаем, на какой стадии диалога мы находимся
+    rows = BDqueries.select_rows('current_dialogs', 'chat_id', str(c.message.chat.id))
+
+    # если диалог находится на стадии выбора одного из городов
+    if rows[0][2] == 7:
+        # вносим id города в текущий диалог
+        BDqueries.set_field_param('stage', '1', c.message.chat.id)
+        BDqueries.set_field_param('city_id', c.data, c.message.chat.id)
+        # вытягиваем описание города
+        city_name = BDqueries.get_city_name(int(c.data))
+        # сносим клавиатуру с выбором городов
+        bot.edit_message_text('Выбран город {d}'.format(d=city_name), c.message.chat.id,
+                              c.message.message_id, reply_markup=None)
+
+        # если выполняется команда bestdeal, включаем сбор дополнительных данных
+        if rows[0][1] == 'bestdeal':
+            choose_price(c.message.chat.id)
+        else:
+            bot.send_message(c.message.chat.id, 'Выберите дату заезда из календаря.')
+            # отсылаем в диалог календарь для выбора даты заезда
+            calendar, step = DetailedTelegramCalendar(min_date=date.today() + timedelta(days=1)).build()
+            bot.send_message(c.message.chat.id, f"Select {LSTEP[step]}", reply_markup=calendar)
+
+    # если диалог на стадии выбора цен
+    elif rows[0][2] == 8:
+        # вносим номер диапазона цены в текущий диалог
+        BDqueries.set_field_param('price_bestdeal', c.data, c.message.chat.id)
+        # сносим клавиатуру с выбором цен
+        bot.edit_message_text('Выбран диапазон цен {d}'.format(d=Dicts.prices[c.data]), c.message.chat.id,
+                              c.message.message_id, reply_markup=None)
+        # переходим к выбору расстояния до центра города
+        choose_distance(c.message.chat.id)
+
+    # если диалог на стадии определения оптимального расстояния до центра
+    elif rows[0][2] == 9:
+        # вносим номер диапазона расстояния в текущий диалог
+        BDqueries.set_field_param('distance_bestdeal', c.data, c.message.chat.id)
+        # сносим клавиатуру с выбором расстояния
+        bot.edit_message_text('Выбрано расстояние до центра {d}'.format(d=Dicts.distances[c.data]), c.message.chat.id,
+                              c.message.message_id, reply_markup=None)
+        # меняем стадию диалога
+        BDqueries.set_field_param('stage', '1', c.message.chat.id)
+        # отсылаем в диалог календарь для выбора даты заезда
+        calendar, step = DetailedTelegramCalendar(min_date=date.today() + timedelta(days=1)).build()
+        bot.send_message(c.message.chat.id, f"Select {LSTEP[step]}", reply_markup=calendar)
+
+    # если диалог находится на стадии выбора дат
+    else:
+        cal(c, rows[0])
+
+
+@logger.catch
+def cal(c: telebot.types.CallbackQuery, row: list) -> None:
+    """Функция обрабатывает ответ календаря"""
+    # инсключаем из календаря лишние даты
+    if row[2] == 1:
+        allow_date = date.today() + timedelta(days=1)
+    else:
+        allow_date = datetime.strptime(row[4], '%Y-%m-%d').date() + timedelta(days=1)
+
+    # обработка календаря
+    result, key, step = DetailedTelegramCalendar(min_date=allow_date).process(c.data)
     if not result and key:
         bot.edit_message_text(f"Select {LSTEP[step]}",
                               c.message.chat.id,
@@ -277,69 +401,30 @@ def cal(c: telebot.types.CallbackQuery) -> None:
         bot.edit_message_text(f"Выбрана дата {result}",
                               c.message.chat.id,
                               c.message.message_id)
-        query = "SELECT * FROM current_dialogs WHERE chat_id = {id}".format(id=str(c.message.chat.id))
-        rows = parsing.bd_select(query)
 
         # инициализация переменных для этапа выбора даты заезда
-        if rows[0][2] == 1:
-            check_date = date.today()
-            err_msg = 'Выбранная дата должна быть больше текущей, повторите ввод!'
+        if row[2] == 1:
             stage = '2'
             field = 'check_in'
             ok_msg = 'Выберите дату отъезда из календаря.'
         # инициализация переменных для этапа выбора даты отъезда
         else:
-            check_date = datetime.strptime(rows[0][4], '%Y-%m-%d').date()
-            err_msg = 'Дата отъезда должна быть больше даты заселения, повторите ввод!'
             stage = '3'
             field = 'check_out'
             ok_msg = 'Введите количество гостей (целое число от 1 до 10).'
 
-        # проверка даты на корректность (заезд после текущей, отъезд после заезда)
-        # если некорректно, пишем пользователю, что он лопух, кидаем ему календарь ещё раз
-        if result <= check_date:
-            bot.send_message(c.message.chat.id, err_msg)
-            calendar, step = DetailedTelegramCalendar().build()
-            bot.send_message(c.message.chat.id, f"Select {LSTEP[step]}", reply_markup=calendar)
-            return None
-        # если все хорошо, сохраняем результат
-        else:
-            query = "UPDATE current_dialogs SET stage = {stg}, {fld} = '{mt}' WHERE chat_id = {id}" \
-                .format(mt=result,
-                        stg=stage,
-                        fld=field,
-                        id=str(c.message.chat.id))
-            bot.send_message(c.message.chat.id, ok_msg)
+        # сохраняем результат
+        BDqueries.set_field_param('stage', stage, c.message.chat.id)
+        BDqueries.set_field_param(field, str(result), c.message.chat.id)
+        bot.send_message(c.message.chat.id, ok_msg)
 
         # отправка в чат календаря для выбора даты отъезда
-        if rows[0][2] == 1:
-            calendar, step = DetailedTelegramCalendar().build()
+        if row[2] == 1:
+            calendar, step = DetailedTelegramCalendar(min_date=allow_date).build()
             bot.send_message(c.message.chat.id, f"Select {LSTEP[step]}", reply_markup=calendar)
-
-        parsing.bd_update(query)
-
-
-@bot.message_handler(content_types=['text'])
-def listener(message: telebot.types.Message) -> None:
-    """Функция слушает сообщения из телеги"""
-    # Проверяем, существует ли активный диалог с данным пользователем
-    query = 'SELECT * FROM current_dialogs WHERE chat_id = ' + str(message.chat.id)
-    rows = parsing.bd_select(query)
-
-    if len(rows) == 0:
-        # Если нет, запускаем стартовое распознавание запроса
-        get_text_messages(message)
-        # если пользователь ввел новую команду, сбрасываем текущий диалог, стартуем с нуля
-    elif message.text.startswith('/'):
-        query = 'DELETE FROM current_dialogs WHERE chat_id = ' + str(message.chat.id)
-        parsing.bd_update(query)
-        get_text_messages(message)
-    else:
-        # Если диалог найден, перебрасываем на продолжение
-        dispetcher(message, rows[0][2] + 1)
 
 
 if __name__ == "__main__":
 
-    init_database()
+    BDqueries.init_database()
     bot.infinity_polling()

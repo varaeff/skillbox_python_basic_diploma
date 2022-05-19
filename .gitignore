@@ -38,6 +38,7 @@ wheels/
 .installed.cfg
 *.egg
 MANIFEST
+test_json
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -123,3 +124,5 @@ venv.bak/
 .mypy_cache/
 .dmypy.json
 dmypy.json
+/test_json/
+/test_json/
