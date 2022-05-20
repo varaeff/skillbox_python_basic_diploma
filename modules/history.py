@@ -1,7 +1,9 @@
-from modules.db_work import BDqueries
-from loguru import logger
 from datetime import datetime
 from typing import List
+
+from loguru import logger
+
+from modules.db_work import insert_row, select_rows
 
 
 @logger.catch
@@ -16,7 +18,7 @@ def set_log(message_id: int,
     try:
         values = {'ms_id': str(message_id), 'ch_id': str(chat_id), 'us_id': str(user_id), 'us_n': username,
                   'ms_dt': str(message_date), 'ms_txt': msg_text, 'ph': photos}
-        BDqueries.insert_row('main_log', ':ms_id, :ch_id, :us_id, :us_n, :ms_dt, :ms_txt, :ph', values)
+        insert_row('main_log', ':ms_id, :ch_id, :us_id, :us_n, :ms_dt, :ms_txt, :ph', values)
     except Exception as exc:
         logger.bind(special=True).info('Ошибка при попытке добавления данных в историю, error - {}'
                                        .format(exc.__str__()))
@@ -25,7 +27,7 @@ def set_log(message_id: int,
 @logger.catch
 def get_history(chat_id: int) -> List[List[str]]:
     """запрос истории переписки"""
-    rows = BDqueries.select_rows('main_log', 'chat_id', str(chat_id))
+    rows = select_rows('main_log', 'chat_id', str(chat_id))
 
     answers = []
     answer, answer_msg = '', ''

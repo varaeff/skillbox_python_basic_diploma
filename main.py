@@ -1,13 +1,16 @@
+from datetime import date, datetime, timedelta
+from typing import List
+
 import telebot
 from decouple import config
-from modules.api_work import hotels_list, city_destination_id
-from modules.db_work import BDqueries
-from modules.history import set_log, get_history
-from modules.service_funcs import check_num, Dicts
-from telegram_bot_calendar import DetailedTelegramCalendar, LSTEP
-from datetime import date, datetime, timedelta
 from loguru import logger
-from typing import List
+from telegram_bot_calendar import LSTEP, DetailedTelegramCalendar
+
+from modules.api_work import city_destination_id, hotels_list
+from modules.db_work import (delete_row, init_database, insert_row,
+                             select_rows, set_field_param)
+from modules.history import get_history, set_log
+from modules.service_funcs import Dicts, check_num
 
 logger.add("debuglog.log", format="{time:YYYY-MM-DD at HH:mm:ss} | {level} | {name} : {function} : {line} | "
                                   "{message}", level="WARNING")
@@ -78,7 +81,7 @@ def get_text_messages(message: telebot.types.Message) -> None:
 def new_session(message: telebot.types.Message, command: str) -> None:
     """Функция создает в БД строку нового открытого диалога"""
     values = {'id': str(message.chat.id), 'cmd': command}
-    BDqueries.insert_row('current_dialogs', ':id, :cmd, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL', values)
+    insert_row('current_dialogs', ':id, :cmd, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL', values)
     dispetcher(message, 0)
 
 
@@ -92,7 +95,7 @@ def dispetcher(message: telebot.types.Message, stage: int) -> None:
     # узнаем дату заезда
     elif stage == 1:
         # пытаемся найти город среди тех, по которым уже был запрос
-        rows = BDqueries.select_rows('cities_code', 'city_name', message.text.capitalize())
+        rows = select_rows('cities_code', 'city_name', message.text.capitalize())
 
         # если нашли хоть один, формируем словарь для дальнейшей обработки
         if len(rows) > 0:
@@ -122,22 +125,22 @@ def dispetcher(message: telebot.types.Message, stage: int) -> None:
                               'lt': float(i_city["latitude"]),
                               'lg': float(i_city["longitude"]),
                               'cpt': i_city["caption"]}
-                    BDqueries.insert_row('cities_code', ':id, :mt, :lt, :lg, :cpt', values)
+                    insert_row('cities_code', ':id, :mt, :lt, :lg, :cpt', values)
 
         # проверяем, сколько городов нашли
         if len(cities) > 1:
             # меняем стадию диалога для колбэка
-            BDqueries.set_field_param('stage', '7', message.chat.id)
+            set_field_param('stage', '7', message.chat.id)
             # отсылаем пользователю список найденных городов в кнопках для выбора нужного
             choose_city(message.chat.id, cities)
             return None
         else:
             # добавляем город в текущий диалог
-            BDqueries.set_field_param('stage', '1', message.chat.id)
-            BDqueries.set_field_param('city_id', str(cities[0]["destinationId"]), message.chat.id)
+            set_field_param('stage', '1', message.chat.id)
+            set_field_param('city_id', str(cities[0]["destinationId"]), message.chat.id)
 
             # если обрабатывается команда bestdeal, включаем сбор дополнительных данных
-            rows = BDqueries.select_rows('current_dialogs', 'chat_id', str(message.chat.id))
+            rows = select_rows('current_dialogs', 'chat_id', str(message.chat.id))
             if rows[0][1] == 'bestdeal':
                 choose_price(message.chat.id)
             else:
@@ -157,8 +160,8 @@ def dispetcher(message: telebot.types.Message, stage: int) -> None:
         if not check_num(message.text, 1, 10):
             bot.send_message(message.chat.id, 'Введите число от 1 до 10!')
             return None
-        BDqueries.set_field_param('stage', '4', message.chat.id)
-        BDqueries.set_field_param('guests_num', message.text, message.chat.id)
+        set_field_param('stage', '4', message.chat.id)
+        set_field_param('guests_num', message.text, message.chat.id)
         bot.send_message(message.chat.id, 'Сколько отелей вы хотите посмотреть (от 1 до 10)?')
 
     # узнаем количество отелей для выборки
@@ -166,8 +169,8 @@ def dispetcher(message: telebot.types.Message, stage: int) -> None:
         if not check_num(message.text, 1, 10):
             bot.send_message(message.chat.id, 'Введите число от 1 до 10!')
             return None
-        BDqueries.set_field_param('stage', '5', message.chat.id)
-        BDqueries.set_field_param('hotels_num', message.text, message.chat.id)
+        set_field_param('stage', '5', message.chat.id)
+        set_field_param('hotels_num', message.text, message.chat.id)
         bot.send_message(message.chat.id, 'Сколько фотографий каждого отеля вы хотите посмотреть (от 0 до 5)?')
 
     # финальный этап. Узнаем количество фотографий для запроса, формируем и отсылаем запрос к API,
@@ -179,16 +182,16 @@ def dispetcher(message: telebot.types.Message, stage: int) -> None:
 
         bot.send_message(message.chat.id, 'Подбираем для вас варианты...')
 
-        BDqueries.set_field_param('stage', '6', message.chat.id)
-        BDqueries.set_field_param('photos_num', message.text, message.chat.id)
+        set_field_param('stage', '6', message.chat.id)
+        set_field_param('photos_num', message.text, message.chat.id)
 
         # инициализируем параметры запроса в API
-        rows = BDqueries.select_rows('current_dialogs', 'chat_id', str(message.chat.id))
+        rows = select_rows('current_dialogs', 'chat_id', str(message.chat.id))
         q_type, city_id, check_in, check_out, guest_num, num_hotels, num_photos = \
             rows[0][1], rows[0][3], rows[0][4], rows[0][5], rows[0][6], rows[0][7], rows[0][8]
 
         # записываем запрос в историю
-        city_name = BDqueries.get_city_name(city_id)
+        city_name = select_rows('cities_code', 'city_id', str(city_id))[0][4]
         goal = {'lowprice': 'дешёвых', 'highprice': 'дорогих', 'bestdeal': 'дешёвых и близких к центру'}
         user_message = "Найди {nh} самых {gl} отелей для {gn} гостей в городе {cn}.\n" \
                        "Дата заезда: {ci}, дата отъезда: {co}.\n" \
@@ -229,7 +232,7 @@ def dispetcher(message: telebot.types.Message, stage: int) -> None:
             add_id = 1
             for i_elem in output:
                 links = list()
-                rows = BDqueries.select_rows('photos_url', 'hotel_id', str(i_elem[1]))
+                rows = select_rows('photos_url', 'hotel_id', str(i_elem[1]))
                 for i_link in range(num_photos):
                     try:
                         links.append(rows[i_link][2])
@@ -263,7 +266,7 @@ def dispetcher(message: telebot.types.Message, stage: int) -> None:
                             answer.date, i_elem[0], '')
 
         # очищаем текущий диалог
-        BDqueries.delete_row(message.chat.id)
+        delete_row(message.chat.id)
 
 
 @logger.catch
@@ -280,7 +283,7 @@ def choose_city(chat_id: int, cities: List[dict]) -> None:
 def choose_price(chat_id: int) -> None:
     """функция формирования и отправки клавиатуры с выбором диапазона цен"""
     # задаем стадию диалога
-    BDqueries.set_field_param('stage', '8', chat_id)
+    set_field_param('stage', '8', chat_id)
 
     # формируем клавиатуру
     keyboard = telebot.types.InlineKeyboardMarkup()
@@ -296,7 +299,7 @@ def choose_price(chat_id: int) -> None:
 def choose_distance(chat_id: int) -> None:
     """функция формирования и отправки клавиатуры с выбором диапазона цен"""
     # задаем стадию диалога
-    BDqueries.set_field_param('stage', '9', chat_id)
+    set_field_param('stage', '9', chat_id)
 
     # формируем клавиатуру
     keyboard = telebot.types.InlineKeyboardMarkup()
@@ -312,14 +315,14 @@ def choose_distance(chat_id: int) -> None:
 def listener(message: telebot.types.Message) -> None:
     """Функция слушает сообщения из телеги"""
     # Проверяем, существует ли активный диалог с данным пользователем
-    rows = BDqueries.select_rows('current_dialogs', 'chat_id', str(message.chat.id))
+    rows = select_rows('current_dialogs', 'chat_id', str(message.chat.id))
 
     if len(rows) == 0:
         # Если нет, запускаем стартовое распознавание запроса
         get_text_messages(message)
         # если пользователь ввел новую команду, сбрасываем текущий диалог, стартуем с нуля
     elif message.text.startswith('/'):
-        BDqueries.delete_row(message.chat.id)
+        delete_row(message.chat.id)
         get_text_messages(message)
     else:
         # Если диалог найден, перебрасываем на продолжение
@@ -331,15 +334,15 @@ def listener(message: telebot.types.Message) -> None:
 def keyboard_select(c: telebot.types.CallbackQuery) -> None:
     """функция ловит ответы клавиатуры и календаря"""
     # узнаем, на какой стадии диалога мы находимся
-    rows = BDqueries.select_rows('current_dialogs', 'chat_id', str(c.message.chat.id))
+    rows = select_rows('current_dialogs', 'chat_id', str(c.message.chat.id))
 
     # если диалог находится на стадии выбора одного из городов
     if rows[0][2] == 7:
         # вносим id города в текущий диалог
-        BDqueries.set_field_param('stage', '1', c.message.chat.id)
-        BDqueries.set_field_param('city_id', c.data, c.message.chat.id)
+        set_field_param('stage', '1', c.message.chat.id)
+        set_field_param('city_id', c.data, c.message.chat.id)
         # вытягиваем описание города
-        city_name = BDqueries.get_city_name(int(c.data))
+        city_name = select_rows('cities_code', 'city_id', c.data)[0][4]
         # сносим клавиатуру с выбором городов
         bot.edit_message_text('Выбран город {d}'.format(d=city_name), c.message.chat.id,
                               c.message.message_id, reply_markup=None)
@@ -356,7 +359,7 @@ def keyboard_select(c: telebot.types.CallbackQuery) -> None:
     # если диалог на стадии выбора цен
     elif rows[0][2] == 8:
         # вносим номер диапазона цены в текущий диалог
-        BDqueries.set_field_param('price_bestdeal', c.data, c.message.chat.id)
+        set_field_param('price_bestdeal', c.data, c.message.chat.id)
         # сносим клавиатуру с выбором цен
         bot.edit_message_text('Выбран диапазон цен {d}'.format(d=Dicts.prices[c.data]), c.message.chat.id,
                               c.message.message_id, reply_markup=None)
@@ -366,12 +369,12 @@ def keyboard_select(c: telebot.types.CallbackQuery) -> None:
     # если диалог на стадии определения оптимального расстояния до центра
     elif rows[0][2] == 9:
         # вносим номер диапазона расстояния в текущий диалог
-        BDqueries.set_field_param('distance_bestdeal', c.data, c.message.chat.id)
+        set_field_param('distance_bestdeal', c.data, c.message.chat.id)
         # сносим клавиатуру с выбором расстояния
         bot.edit_message_text('Выбрано расстояние до центра {d}'.format(d=Dicts.distances[c.data]), c.message.chat.id,
                               c.message.message_id, reply_markup=None)
         # меняем стадию диалога
-        BDqueries.set_field_param('stage', '1', c.message.chat.id)
+        set_field_param('stage', '1', c.message.chat.id)
         # отсылаем в диалог календарь для выбора даты заезда
         calendar, step = DetailedTelegramCalendar(min_date=date.today() + timedelta(days=1)).build()
         bot.send_message(c.message.chat.id, f"Select {LSTEP[step]}", reply_markup=calendar)
@@ -414,8 +417,8 @@ def cal(c: telebot.types.CallbackQuery, row: list) -> None:
             ok_msg = 'Введите количество гостей (целое число от 1 до 10).'
 
         # сохраняем результат
-        BDqueries.set_field_param('stage', stage, c.message.chat.id)
-        BDqueries.set_field_param(field, str(result), c.message.chat.id)
+        set_field_param('stage', stage, c.message.chat.id)
+        set_field_param(field, str(result), c.message.chat.id)
         bot.send_message(c.message.chat.id, ok_msg)
 
         # отправка в чат календаря для выбора даты отъезда
@@ -426,5 +429,5 @@ def cal(c: telebot.types.CallbackQuery, row: list) -> None:
 
 if __name__ == "__main__":
 
-    BDqueries.init_database()
+    init_database()
     bot.infinity_polling()

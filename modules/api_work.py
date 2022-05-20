@@ -1,12 +1,13 @@
-import requests
 import json
-from decouple import config
-from typing import Union, List
-from loguru import logger
 from datetime import datetime
-from modules.db_work import BDqueries
-from modules.service_funcs import distance, Dicts
+from typing import List, Union
 
+import requests
+from decouple import config
+from loguru import logger
+
+from modules.db_work import insert_row, select_rows
+from modules.service_funcs import Dicts, distance
 
 headers = {"X-RapidAPI-Host": config('API_HOST'),
            "X-RapidAPI-Key": config('API_KEY')}
@@ -39,7 +40,7 @@ def hotels_list(city_id: str, q_type: str, check_in: str, check_out: str, guest_
             dist_max = Dicts.distance_max[dist_bstd]
 
     # вытаскиваем координаты центра города
-    rows = BDqueries.select_rows('cities_code', 'city_id', city_id)
+    rows = select_rows('cities_code', 'city_id', city_id)
     city_lat, city_long = rows[0][2], rows[0][3]
 
     # считаем количество ночей проживания
@@ -148,7 +149,7 @@ def city_destination_id(city: str) -> Union[List[dict], None]:
 def save_photos(hotel_id: str) -> None:
     """сохранение фотографий отеля в БД"""
     # проверяем БД на наличие фоток отеля. Если есть, выходим из функции
-    rows = BDqueries.select_rows('photos_url', 'hotel_id', str(hotel_id))
+    rows = select_rows('photos_url', 'hotel_id', str(hotel_id))
     if len(rows) > 0:
         return None
 
@@ -167,7 +168,7 @@ def save_photos(hotel_id: str) -> None:
         num = 0
         for i_elem in resp_data["hotelImages"]:
             values = {'id': hotel_id, 'ph_id': i_elem["imageId"], 'url': i_elem["baseUrl"].format(size='w')}
-            BDqueries.insert_row('photos_url', ':id, :ph_id, :url', values)
+            insert_row('photos_url', ':id, :ph_id, :url', values)
             num += 1
             if num == 5:
                 break

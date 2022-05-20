@@ -1,5 +1,6 @@
-from loguru import logger
 import math
+
+from loguru import logger
 
 
 @logger.catch
