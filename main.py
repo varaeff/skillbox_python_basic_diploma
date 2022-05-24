@@ -17,6 +17,9 @@ logger.add("debuglog.log", format="{time:YYYY-MM-DD at HH:mm:ss} | {level} | {na
 logger.add("catch_log.log", filter=lambda record: "special" in record["extra"],
            format="{time:YYYY-MM-DD at HH:mm:ss} | {level} | {name} : {function} : {line} | {message}")
 
+logger.add("user_log.log", filter=lambda record: "user" in record["extra"],
+           format="{time:YYYY-MM-DD at HH:mm:ss} | {name} : {function} : {line} | {message}")
+
 token = config('BOT_TOKEN')
 bot = telebot.TeleBot(token)
 
@@ -24,13 +27,21 @@ bot = telebot.TeleBot(token)
 @logger.catch
 def get_text_messages(message: telebot.types.Message) -> None:
     """Функция запускает ветку нового диалога с пользователем в зависимости от полученного сообщения"""
+    help_text = '/lowprice - узнать топ самых дешёвых отелей в городе\n' \
+                '/highprice - узнать топ самых дорогих отелей в городе\n' \
+                '/bestdeal - узнать список самых дешёвых отелей в городе, находящихся ближе всего к центру\n' \
+                '/history - узнать историю поиска отелей\n' \
+                '/help - помощь по командам бота'
+    hello_text = 'Привет, <b>{}</b>, меня зовут Сергей Вараев и это мой дипломный проект по курсу Python-basic.\n\n'.\
+        format(message.from_user.username)
+
     if not message.text.startswith('/'):
         set_log(message.message_id, message.chat.id, message.from_user.id, message.from_user.username, message.date,
                 message.text, '')
 
     if message.text.lower() == "привет":
-        answer_text = 'Привет, <b>' + message.from_user.username + \
-                      '</b>, меня зовут Сергей Вараев и это мой дипломный проект по курсу Python-basic.'
+        answer_text = hello_text
+
     elif message.text == "/lowprice":
         new_session(message, 'lowprice')
         return None
@@ -44,6 +55,7 @@ def get_text_messages(message: telebot.types.Message) -> None:
         return None
 
     elif message.text == "/history":
+        logger.bind(user=True).info('user {id} asked for history'.format(id=message.from_user.id))
         parts = get_history(message.chat.id)
         for row in parts:
             if row[1] == '':
@@ -61,13 +73,15 @@ def get_text_messages(message: telebot.types.Message) -> None:
         return None
 
     elif message.text == "/help":
-        answer_text = '/lowprice - узнать топ самых дешёвых отелей в городе\n' \
-                      '/highprice - узнать топ самых дорогих отелей в городе\n' \
-                      '/bestdeal - узнать список самых дешёвых отелей в городе, находящихся ближе всего к центру\n' \
-                      '/history - узнать историю поиска отелей\n' \
-                      '/help - помощь по командам бота'
+        logger.bind(user=True).info('user {id} asked for help'.format(id=message.from_user.id))
+        answer_text = help_text
+
+    elif message.text == "/start":
+        logger.bind(user=True).info('user {id} started bot'.format(id=message.from_user.id))
+        answer_text = hello_text + help_text
 
     else:
+        logger.bind(user=True).info("user {id} typed '{txt}'".format(id=message.from_user.id, txt=message.text))
         answer_text = "Команда не распознана! Повторите ввод."
 
     if len(answer_text) > 0:
@@ -80,6 +94,7 @@ def get_text_messages(message: telebot.types.Message) -> None:
 @logger.catch
 def new_session(message: telebot.types.Message, command: str) -> None:
     """Функция создает в БД строку нового открытого диалога"""
+    logger.bind(user=True).info('user {id} started new {cmd} session'.format(id=message.from_user.id, cmd=command))
     values = {'id': str(message.chat.id), 'cmd': command}
     insert_row('current_dialogs', ':id, :cmd, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL', values)
     dispetcher(message, 0)
@@ -94,6 +109,8 @@ def dispetcher(message: telebot.types.Message, stage: int) -> None:
 
     # узнаем дату заезда
     elif stage == 1:
+        logger.bind(user=True).info('user {id} tryed to find city {ct}'.format(id=message.from_user.id,
+                                                                               ct=message.text))
         # пытаемся найти город среди тех, по которым уже был запрос
         rows = select_rows('cities_code', 'city_name', message.text.capitalize())
 
@@ -153,6 +170,9 @@ def dispetcher(message: telebot.types.Message, stage: int) -> None:
     # этапы выбора дат. Не реагируем на текстовые сообщения, ждем ответ от календаря
     # 8 - запрет реакции на сообщения при ожидании выбора города с клавиатуры
     elif 1 < stage < 4 or stage > 7:
+        logger.bind(user=True).info('user {id} typed {txt} on wrong stage ({stg})'.format(id=message.from_user.id,
+                                                                                          txt=message.text,
+                                                                                          stg=stage))
         bot.delete_message(message.chat.id, message.message_id)
 
     # узнаем количество гостей для выборки
@@ -162,6 +182,7 @@ def dispetcher(message: telebot.types.Message, stage: int) -> None:
             return None
         set_field_param('stage', '4', message.chat.id)
         set_field_param('guests_num', message.text, message.chat.id)
+        logger.bind(user=True).info('user {id} selected {num} guests'.format(id=message.from_user.id, num=message.text))
         bot.send_message(message.chat.id, 'Сколько отелей вы хотите посмотреть (от 1 до 10)?')
 
     # узнаем количество отелей для выборки
@@ -171,6 +192,7 @@ def dispetcher(message: telebot.types.Message, stage: int) -> None:
             return None
         set_field_param('stage', '5', message.chat.id)
         set_field_param('hotels_num', message.text, message.chat.id)
+        logger.bind(user=True).info('user {id} selected {num} hotels'.format(id=message.from_user.id, num=message.text))
         bot.send_message(message.chat.id, 'Сколько фотографий каждого отеля вы хотите посмотреть (от 0 до 5)?')
 
     # финальный этап. Узнаем количество фотографий для запроса, формируем и отсылаем запрос к API,
@@ -184,6 +206,7 @@ def dispetcher(message: telebot.types.Message, stage: int) -> None:
 
         set_field_param('stage', '6', message.chat.id)
         set_field_param('photos_num', message.text, message.chat.id)
+        logger.bind(user=True).info('user {id} selected {num} photos'.format(id=message.from_user.id, num=message.text))
 
         # инициализируем параметры запроса в API
         rows = select_rows('current_dialogs', 'chat_id', str(message.chat.id))
@@ -227,6 +250,8 @@ def dispetcher(message: telebot.types.Message, stage: int) -> None:
             # сохраняем историю
             set_log(answer.message_id, answer.chat.id, answer.from_user.id, answer.from_user.username, answer.date,
                     output_txt, '')
+            logger.bind(user=True).info('user {id} got answer {aid} in main_log'.format(id=message.from_user.id,
+                                                                                        aid=answer.message_id))
         # - ответ с фотографиями
         else:
             add_id = 1
@@ -254,6 +279,9 @@ def dispetcher(message: telebot.types.Message, stage: int) -> None:
                     # сохраняем историю
                     set_log(message.message_id + add_id, message.chat.id, 5161451101, 'HotelsVrvBot', message.date,
                             i_elem[0], links_to_log)
+                    logger.bind(user=True).info('user {id} got answer {aid} '
+                                                'in main_log'.format(id=message.from_user.id,
+                                                                     aid=message.message_id + add_id))
                     add_id += 1
                 # если был сбой и в базе пусто или произошел сбой отправки, выдаем ответ без них
                 except Exception as exc:
@@ -264,6 +292,9 @@ def dispetcher(message: telebot.types.Message, stage: int) -> None:
                     # сохраняем историю
                     set_log(answer.message_id, answer.chat.id, answer.from_user.id, answer.from_user.username,
                             answer.date, i_elem[0], '')
+                    logger.bind(user=True).info('user {id} got answer {aid} '
+                                                'in main_log'.format(id=message.from_user.id,
+                                                                     aid=message.message_id + add_id))
 
         # очищаем текущий диалог
         delete_row(message.chat.id)
@@ -346,6 +377,7 @@ def keyboard_select(c: telebot.types.CallbackQuery) -> None:
         # сносим клавиатуру с выбором городов
         bot.edit_message_text('Выбран город {d}'.format(d=city_name), c.message.chat.id,
                               c.message.message_id, reply_markup=None)
+        logger.bind(user=True).info('user {id} selected city {ct}'.format(id=c.message.from_user.id, ct=city_name))
 
         # если выполняется команда bestdeal, включаем сбор дополнительных данных
         if rows[0][1] == 'bestdeal':
@@ -363,6 +395,8 @@ def keyboard_select(c: telebot.types.CallbackQuery) -> None:
         # сносим клавиатуру с выбором цен
         bot.edit_message_text('Выбран диапазон цен {d}'.format(d=Dicts.prices[c.data]), c.message.chat.id,
                               c.message.message_id, reply_markup=None)
+        logger.bind(user=True).info('user {id} selected price {p}'.format(id=c.message.from_user.id,
+                                                                          p=Dicts.prices[c.data]))
         # переходим к выбору расстояния до центра города
         choose_distance(c.message.chat.id)
 
@@ -373,6 +407,8 @@ def keyboard_select(c: telebot.types.CallbackQuery) -> None:
         # сносим клавиатуру с выбором расстояния
         bot.edit_message_text('Выбрано расстояние до центра {d}'.format(d=Dicts.distances[c.data]), c.message.chat.id,
                               c.message.message_id, reply_markup=None)
+        logger.bind(user=True).info('user {id} selected distance {dst}'.format(id=c.message.from_user.id,
+                                                                               dst=Dicts.distances[c.data]))
         # меняем стадию диалога
         set_field_param('stage', '1', c.message.chat.id)
         # отсылаем в диалог календарь для выбора даты заезда
@@ -404,6 +440,7 @@ def cal(c: telebot.types.CallbackQuery, row: list) -> None:
         bot.edit_message_text(f"Выбрана дата {result}",
                               c.message.chat.id,
                               c.message.message_id)
+        logger.bind(user=True).info('user {id} selected date {dt}'.format(id=c.message.from_user.id, dt=result))
 
         # инициализация переменных для этапа выбора даты заезда
         if row[2] == 1:

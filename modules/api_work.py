@@ -69,9 +69,9 @@ def hotels_list(city_id: str, q_type: str, check_in: str, check_out: str, guest_
                         + i_elem["address"]["streetAddress"] + '\n' + '<b>Расстояние до центра:</b> ' \
                         + str(dist) + ' км\n' + \
                         '<b>Цена за сутки:</b> ' + str(i_elem["ratePlan"]["price"]["exactCurrent"]) + ' RUB\n' + \
-                        '<b>Всего:</b> ' + str(i_elem["ratePlan"]["price"]["exactCurrent"] * nights) + ' RUB\n' + \
-                        '<a href=\'https://www.hotels.com/ho' + str(i_elem["id"]) + '\'>Посмотреть на сайте</a>' + \
-                        '\n\n'
+                        '<b>Всего:</b> ' + str(round(i_elem["ratePlan"]["price"]["exactCurrent"] * nights, 2)) + \
+                        ' RUB\n' + '<a href=\'https://www.hotels.com/ho' + str(i_elem["id"]) + \
+                        '\'>Посмотреть на сайте</a>' + '\n\n'
         except Exception as exc:
             logger.bind(special=True).info('Ошибка при сборе информации об отеле id={id}, error - {er}'
                                            .format(id=i_elem["id"], er=exc.__str__()))
